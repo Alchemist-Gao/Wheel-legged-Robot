@@ -1,0 +1,185 @@
+#include <Servo.h>
+#include <NewPing.h>
+#include <SoftwareSerial.h>
+#include <LobotServoController.h>
+
+#define TRIG   7          /*超声波TRIG引脚为 7号IO*/
+#define ECHO   6          /*超声波ECHO引脚为 6号IO*/
+#define MAX_DISTANCE 200  /*最大检测距离为200cm*/
+
+#define GO_FORWARD  1     /*直走的动作组*/
+#define GO_BACK     2     /*后退动作组*/
+#define TURN_LEFT   36     /*左转动作组*/
+#define TURN_RIGHT  37     /*右转动作组*/
+
+#define MIN_DISTANCE_TURN 30  /*避障距离，就是小于多少距离的时候进行避障*/
+#define BIAS 7        /*舵机偏差，根据实际情况调整大小以使超声波朝向正前方 -响右 +向左*/
+
+#define rxPin 11
+#define txPin 10
+
+SoftwareSerial MySerial(rxPin, txPin);
+LobotServoController Controller(MySerial);  //实例化舵机控制板二次开发类,使用1号串口作为通信接口
+NewPing Sonar(TRIG, ECHO, MAX_DISTANCE);     //实例化超声波测距类
+Servo sonarServo;     //超声波云台舵机控制类实例
+
+float gDistance;    //全局变量，用于存储中间位置超声波测得的距离
+float gLDistance;   //用于存储机器人左侧测得的距离
+float gRDistance;   //用于存储机器人右侧测得的距离
+
+bool ledON = true;            //led点亮标识，true时点亮，false熄灭
+void ledFlash() {
+  static uint32_t Timer;      //定义静态变量Timer， 用于计时
+  if (Timer > millis())       //Timer 大于 millis（）（运行的总毫秒数）时返回，
+    return;
+  //Timer 小于 运行总毫秒数时继续
+  if (ledON) {
+    digitalWrite(13, HIGH);   //如果点亮标识true，13号IO置高电平,板上LED灯被点亮
+    Timer = millis() + 20;    //Timer = 当前运行的总毫秒数 + 20  实现 20毫秒后再次运行
+    ledON = false;            //置点亮标识为false
+  } else {
+    ledON = false;            //如果点亮标识不是true，置点亮标识为false
+    digitalWrite(13, LOW);    //置13号IO为低电平，板上LED熄灭
+  }
+}
+
+float getDistance() {       //获得距离
+  uint32_t lEchoTime;     //变量 ，用于保存检测到的脉冲高电平时间
+  lEchoTime = Sonar.ping_median(5);           //检测9次超声波
+  float lDistance = ((float)lEchoTime) / US_ROUNDTRIP_CM;//转换检测到的脉冲高电平时间为厘米
+  return lDistance;                           //返回检测到的距离
+}
+
+void getAllDistance()//获得前及左右三个方向的距离
+{
+  int tDistance;     //用于暂存测得距离
+  sonarServo.write(90 + BIAS);   //超声波云台舵机转到90度即中间位置
+  delay(100);                    //等待200ms，等待舵机转动到位
+  gDistance = getDistance();     //测量距离，保存到全局变脸gDistance
+  
+  sonarServo.write(130 + BIAS);  //超声波云台舵机转到130度位置即机器人左面40度位置
+  delay(100);                    //延时，等待舵机转动到位
+  tDistance = getDistance();     //测量距离，保存到 tDistance
+  sonarServo.write(170 + BIAS);  //转动到170度，即机器人左侧80度位置
+  delay(100);                    //延时，等待舵机转动到位
+  gLDistance = getDistance();    //测量距离，保存到 gLDistance
+  if(tDistance < gLDistance)     //比较左侧测得的两个距离，取小的一个，保存到gLDistance作为左侧距离
+    gLDistance = tDistance;
+  
+  sonarServo.write(50 + BIAS);   //超声波云台舵机转到50度位置即机器人右面40度位置    
+  delay(100);                    //延时，等待舵机转动到位
+  tDistance = getDistance();     //测量距离，保存到tDistance
+  sonarServo.write(10 + BIAS);   //转到10度，即机器人右面80度位置
+  delay(200);                    //延时，等待舵机转动到位
+  gRDistance = getDistance();    //测量距离，保存到gRDistance
+  if(tDistance < gRDistance)     //比较两个距离，将较小的一个保存到gRDistance
+    gRDistance = tDistance;      
+    
+  sonarServo.write(90 + BIAS);   //超声波云台舵机转回中间位置
+}
+
+void sonar()  //避障逻辑
+{
+  static uint32_t timer = 0;   //静态变量，用于计时
+  static uint8_t step = 0;     //静态变量，用于记录步骤
+  if (timer > millis())  //如果设定时间大于当前毫秒数则返回，否侧继续后续操作
+    return;
+  switch (step)  //根据step分支
+  {
+    case 0:  //步骤0
+      gDistance = getDistance();   //测量距离，保存到gDistance
+      if (gDistance > MIN_DISTANCE_TURN || gDistance == 0) {  //如果测得距离大于指定的避障距离，前进
+        if (!Controller.isRunning()) {
+          Controller.runActionGroup(GO_FORWARD, 0); //一直前进
+          step = 1; //转移到步骤1
+          timer = millis() + 500;  //延时500ms
+        }
+      } else {  //如果测得距离小于指定距离
+        step = 2;  //转移到步骤2
+        timer = millis() + 100; //延时100ms
+      }
+      break; //结束switch语句
+    case 1:  //步骤1
+      gDistance = getDistance(); //测量距离
+      if (gDistance < MIN_DISTANCE_TURN && gDistance > 0) {  //如果测得距离小于指定的避障距离，则停止所有动作组，转移到步骤2
+        Controller.stopActionGroup();
+        step = 2;
+      }
+      break; //结束switch语句
+    case 2:  //步骤2
+      if (!Controller.isRunning()) {   //没有动作组在运行，即等待动作组运行完毕
+        getAllDistance();            //获得三个方向的距离
+//        Serial.println(gDistance);  //打印测得距离
+//        Serial.println(gLDistance);
+//        Serial.println(gRDistance);
+        step = 3; //转移到步骤3
+        //此处没有break，执行完后直接之心case 3
+      }else{
+        gDistance = getDistance();   //如果正在运行的动作组没有运行完毕，那么获得中间方向距离，并延时500ms
+        timer = millis() + 500;
+        break;  //结束switch
+      }
+    case 3:  //步骤3
+      static bool lastActionIsGoBack = false;   //静态变量，记录最后的动作是不是后退
+      if (((gDistance > MIN_DISTANCE_TURN) || (gDistance == 0)) && lastActionIsGoBack == false) {
+        //中间距离大于指定避障距离且最后的一个动作不是后退，那么就回到步骤0，
+        //此处判断最后一个动作是不是后退，是避免程序陷入后退-》前进-》后退-》前进...这样的死循环
+        //当最后一步是后退是就不执行前进
+        step = 0;
+        timer = millis() + 200;
+        lastActionIsGoBack = false;
+        return; //返回，结束函数
+      }
+      if ((((gLDistance > gRDistance) && (gLDistance > MIN_DISTANCE_TURN)) || gLDistance == 0) && gDistance > 5) {
+      //超声波测得左侧的最小距离大于右侧的最小距离大于指定的避障距离，并且中间测得距离大于15时
+      //检测中间的距离目的是避免有物体处于机器人两个前腿之间，导致机器人无法转向
+        if (!Controller.isRunning()) {   //等待动作组运行完毕
+          Controller.runActionGroup(TURN_LEFT, 6);  //左转6次，，根据实际调节
+          lastActionIsGoBack = false;  //标识最后一个动作不是后退
+          step = 2;  //转移到步骤2
+        }
+        timer = millis() + 500; //延时500ms
+        return; //返回，结束函数
+      }
+      if ((((gRDistance > gLDistance) && (gRDistance > MIN_DISTANCE_TURN)) || gRDistance == 0) && gDistance > 5) {
+      //超声波测得左侧的最小距离大于右侧的最小距离大于指定的避障距离，并且中间测得距离大于15时
+        if (!Controller.isRunning()) {   //等待动作组运行完毕
+          Controller.runActionGroup(TURN_RIGHT, 6);  //右转6次，根据实际调节
+          lastActionIsGoBack = false;  //标识最后一个动作不是后退
+          step = 2;  //转移到步骤2
+        }
+        timer = millis() + 500;   //延时500ms
+        return;  //返回，结束函数
+      }
+      //当前面的都不符合，所有的return都没有被执行
+      //程序就会执行到这里
+      Controller.runActionGroup(GO_BACK, 2);  //执行后退动作组3次
+      lastActionIsGoBack = true;  //标识最后一个动作是后退
+      step = 2;     //转移到步骤2
+      timer = millis() + 500;     //延时500ms
+  }
+}
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(9600);  //初始化串口0，波特率9600
+  MySerial.begin(9600); //初始化软串
+  pinMode(13, OUTPUT);                        //设置板上led 13号IO口为输出
+  delay(500);                                 //延时500ms，等待舵机控制板就绪
+   sonarServo.attach(9);                       //设定9号io为舵机控制iO
+  sonarServo.write(90 + BIAS);                //转到中间位置，加上了偏差
+  Controller.runActionGroup(0, 1);            //运行0号动作组，让机器人立正站好
+  if(!Controller.waitForStop(10000))
+  {
+    Serial.println("ERROR IN SETUP");
+  }else{
+    Serial.println("SETUP FINISHED");//等待动作组执行完成，超时时间10ms。
+  }
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  Controller.receiveHandle(); //接收处理函数，从串口接收缓存中取出数据
+  sonar();                    //避障逻辑实现
+  ledFlash();                 //led闪灯，用于运行状态提示
+}
